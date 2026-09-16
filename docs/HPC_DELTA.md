@@ -61,9 +61,12 @@ python src/data/corpus_stats.py --corpus "$CB2_CORPUS" --out analysis/data
 bash hpc/submit.sh hpc/pack_corpus.sbatch
 ```
 
-Writes `train_<seqlen>_hpc/` and `eval_random_<seqlen>_hpc/` under `$CB2_PACKED`,
-each a `tokens.u16` memmap + `meta.json`. Set `CB2_MAX_TOKENS` to cap the budget
-(pilot runs used 2.5B and 5B); the default packs the full weighted pool.
+Writes `train_<seqlen>_hpc/` and `eval_random_<seqlen>_hpc/` under `$CB2_PACKED`.
+Each contains `tokens.u16`, `segment_lengths.u16`,
+`block_segment_offsets.u64`, and `meta.json`. Set `CB2_MAX_TOKENS` to cap the
+budget (pilot runs used 2.5B and 5B); the default packs the full weighted pool.
+The final selected document is always retained completely, so its tokens may
+put the result slightly above the requested cap.
 Check the tail of `logs/pack-*.out` for the `PACK_DONE` line and confirm
 `n_tokens` in `meta.json` is what you intended.
 

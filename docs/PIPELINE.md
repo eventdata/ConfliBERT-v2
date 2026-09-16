@@ -118,13 +118,26 @@ python src/data/pack_tokens.py --corpus .../parquet --split train \
   --max-tokens <budget> --dedup --seed 7 --out <packed>/train_1024_<tag>
 ```
 
-**Output contract** - a directory containing exactly two files:
+Documents are tokenized without truncation. A document stays intact when its
+content plus the tokenizer's `[CLS]` and `[SEP]` tokens fit within `seqlen`;
+only longer documents are split, and no content tokens are dropped. Every
+resulting segment is stored as `[CLS] content [SEP]` and packed with an online,
+bounded-memory best-fit algorithm.
 
-- `tokens.u16` - uint16 memmap, shape `(n_blocks, seqlen)`, docs concatenated
-  with `[SEP]`, no padding, no special tokens beyond the separator;
-- `meta.json` - `seqlen`, `n_blocks`, `n_tokens`, `n_docs`, `tokenizer`,
-  `source_weights`, `max_tokens`, `dedup` - the pack's provenance. Never edit
-  it by hand; never mix packs made with different tokenizers.
+**Output contract** - a directory containing four files:
+
+- `tokens.u16` - uint16 memmap with shape `(n_blocks, seqlen)`; unused block
+  tails contain the tokenizer's PAD ID for fixed-width storage;
+- `segment_lengths.u16` - the real length of every document segment;
+- `block_segment_offsets.u64` - offsets mapping each block to its range in
+  `segment_lengths.u16`;
+- `meta.json` - format version, dimensions, real/storage token counts, packing
+  efficiency, tokenizer IDs, and provenance. Never edit it by hand or mix packs
+  created with different tokenizers.
+
+`--max-tokens` counts real tokens, including `[CLS]` and `[SEP]`. Once a
+document has been selected it is kept in full, so the cap may be exceeded by
+that final document rather than truncating it.
 
 **Naming convention:** `train_<seqlen>_<tag>` / `eval_random_<seqlen>_<tag>`.
 The `<tag>` says what is inside (`native`, `aug`, `5b`, `hpc`...). Packs must
