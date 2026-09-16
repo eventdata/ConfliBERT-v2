@@ -3,10 +3,10 @@
 Domain-adaptive pretraining (DAPT) of ModernBERT via continued MLM.
 
 Reads packed uint16 token blocks (from pack_tokens.py), masks with a configurable
-rate (ModernBERT default 0.30), and continues masked-LM training. bf16, SDPA
-attention, gradient accumulation, checkpoint/resume, and a metrics CSV logging
-tokens-seen / loss / lr / tokens-per-sec so ablations are budget-comparable and
-R can plot the curves.
+rate (ModernBERT default 0.30), and continues masked-LM training. bf16,
+padding-free FlashAttention-2, gradient accumulation, checkpoint/resume, and a
+metrics CSV logging tokens-seen / loss / lr / tokens-per-sec so ablations are
+budget-comparable and R can plot the curves.
 
 Usage (single GPU):
   python train_dapt.py \
@@ -19,34 +19,115 @@ divide the single-GPU --accum by the GPU count to keep the same global batch):
   torchrun --nproc_per_node 4 train_dapt.py ... --bsz 16 --accum 1
 """
 from __future__ import annotations
-import argparse, csv, json, os, time
+import argparse, csv, inspect, json, os, time
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 from transformers import (AutoModelForMaskedLM, AutoTokenizer,
                           DataCollatorForLanguageModeling, Trainer,
                           TrainingArguments, TrainerCallback)
+from transformers import DataCollatorWithFlattening
 
 MODERNBERT = "answerdotai/ModernBERT-base"
 
 
 class PackedBlocks(Dataset):
-    """Memmap-backed fixed-length token blocks with precomputed special-token masks."""
-    def __init__(self, packed_dir, special_ids):
-        meta = json.load(open(os.path.join(packed_dir, "meta.json")))
+    """Memmap-backed blocks with explicit attention-segment lengths."""
+    def __init__(self, packed_dir):
+        with open(os.path.join(packed_dir, "meta.json")) as meta_file:
+            meta = json.load(meta_file)
+        if meta.get("format_version") != 2:
+            raise ValueError(f"{packed_dir} has no document boundaries; rebuild the pack")
         self.seqlen = meta["seqlen"]
         self.n = meta["n_blocks"]
-        self.arr = np.memmap(os.path.join(packed_dir, meta["path"]), dtype=np.uint16,
+        self.n_tokens = meta["n_tokens"]
+        self.n_segments = meta["n_segments"]
+        self.packing_efficiency = meta["packing_efficiency"]
+        self.cls_token_id = meta["cls_token_id"]
+        self.separator_token_id = meta["separator_token_id"]
+        self.pad_token_id = meta["pad_token_id"]
+        self.arr = np.memmap(os.path.join(packed_dir, meta["path"]), dtype=meta["dtype"],
                              mode="r", shape=(self.n, self.seqlen))
-        self.special = np.array(sorted(special_ids), dtype=np.int64)
+        self.segment_lengths = np.memmap(
+            os.path.join(packed_dir, meta["segment_lengths_path"]),
+            dtype=meta["segment_lengths_dtype"], mode="r", shape=(self.n_segments,))
+        self.block_segment_offsets = np.memmap(
+            os.path.join(packed_dir, meta["block_segment_offsets_path"]),
+            dtype=meta["block_segment_offsets_dtype"], mode="r", shape=(self.n + 1,))
+        if int(self.block_segment_offsets[0]) != 0 \
+                or int(self.block_segment_offsets[-1]) != self.n_segments:
+            raise ValueError(f"invalid block offsets in {packed_dir}")
 
     def __len__(self):
         return self.n
 
     def __getitem__(self, i):
-        row = np.asarray(self.arr[i], dtype=np.int64)
-        stm = np.isin(row, self.special).astype(np.int64)
-        return {"input_ids": row, "special_tokens_mask": stm}
+        start = int(self.block_segment_offsets[i])
+        end = int(self.block_segment_offsets[i + 1])
+        lengths = np.asarray(self.segment_lengths[start:end])
+        real_length = int(lengths.sum())
+        if not len(lengths) or real_length > self.seqlen:
+            raise ValueError(f"invalid packed block {i}")
+        # Do not return the stored PAD tail.
+        input_ids = np.asarray(self.arr[i, :real_length])
+        return {"input_ids": input_ids, "segment_lengths": lengths}
+
+
+class PackedMLMCollator:
+    """Flatten document segments with HF, then apply standard MLM masking."""
+    def __init__(self, tokenizer, mlm_probability, legacy_modernbert_inputs=False):
+        self.special_ids = set(tokenizer.all_special_ids)
+        self.flatten = DataCollatorWithFlattening(return_flash_attn_kwargs=True)
+        self.mlm = DataCollatorForLanguageModeling(
+            tokenizer=tokenizer, mlm=True, mlm_probability=mlm_probability)
+        self.legacy_modernbert_inputs = legacy_modernbert_inputs
+
+    def __call__(self, features):
+        segments = []
+        special_tokens_mask = []
+        for feature in features: 
+            input_ids = feature["input_ids"].tolist()
+            cursor = 0
+            for length in feature["segment_lengths"].tolist():
+                end = cursor + length
+                segment = input_ids[cursor:end]
+                if len(segment) != length:
+                    raise ValueError("segment lengths exceed the packed tokens")
+                segments.append({"input_ids": segment})
+                special_tokens_mask.extend(token in self.special_ids for token in segment)
+                cursor = end
+            if cursor != len(input_ids):
+                raise ValueError("segment lengths do not cover the packed tokens")
+
+        batch = self.flatten(segments) #packed sequence that contains position_ids (for RopR) and cu_seq_lens_q,cu_seq_lens_k for FlashAttention2 that handles the cross-attention
+        special_tokens_mask = torch.tensor([special_tokens_mask], dtype=torch.bool)
+        batch["input_ids"], batch["labels"] = self.mlm.torch_mask_tokens(
+            batch["input_ids"], special_tokens_mask=special_tokens_mask)
+
+        total_tokens = batch["input_ids"].shape[-1]
+        if int(batch["cu_seq_lens_q"][-1]) != total_tokens:
+            raise AssertionError("attention boundaries do not cover every input token")
+
+        if self.legacy_modernbert_inputs:
+            # Transformers 4.x ModernBERT uses the original packed-input names.
+            cu_seqlens = batch.pop("cu_seq_lens_q")
+            if not torch.equal(cu_seqlens, batch.pop("cu_seq_lens_k")):
+                raise AssertionError("self-attention Q/K boundaries must match")
+            max_seqlen = batch.pop("max_length_q")
+            if max_seqlen != batch.pop("max_length_k"):
+                raise AssertionError("self-attention Q/K maximum lengths must match")
+            for key in ("input_ids", "labels", "position_ids"):
+                batch[key] = batch[key].squeeze(0)
+            batch.update({
+                "indices": torch.arange(total_tokens, dtype=torch.int64),
+                "cu_seqlens": cu_seqlens,
+                "max_seqlen": max_seqlen,
+                "batch_size": 1,
+                "seq_len": total_tokens,
+                # ModernBERT 4.x checks for padding before handling 1-D packed input.
+                "attention_mask": torch.ones((1, total_tokens), dtype=torch.bool),
+            })
+        return batch
 
 
 class NewEmbedWarmup(TrainerCallback):
@@ -134,6 +215,9 @@ def main():
     ap.add_argument("--eval-steps", type=int, default=1000)
     ap.add_argument("--log-steps", type=int, default=50)
     ap.add_argument("--grad-checkpointing", action="store_true")
+    ap.add_argument("--torch-compile", action=argparse.BooleanOptionalAction, default=True,
+                    help="selectively compile supported ModernBERT components "
+                         "(use --no-torch-compile to disable)")
     ap.add_argument("--mem-fraction", type=float, default=0.82,
                     help="cap process VRAM to leave headroom for the desktop")
     ap.add_argument("--new-embed-warmup-steps", type=int, default=0,
@@ -166,7 +250,9 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.base, clean_up_tokenization_spaces=False)
     # fp32 master weights + bf16 autocast (via TrainingArguments bf16=True) for stable optimization
     model = AutoModelForMaskedLM.from_pretrained(
-        args.base, dtype=torch.float32, attn_implementation="sdpa")
+        args.base, torch_dtype=torch.float32, attn_implementation="flash_attention_2")
+    legacy_modernbert_inputs = "cu_seqlens" in inspect.signature(model.forward).parameters
+    model.config.reference_compile = args.torch_compile
     if args.grad_checkpointing:
         model.gradient_checkpointing_enable()
 
@@ -177,16 +263,26 @@ def main():
         model = get_peft_model(model, cfg)
         model.print_trainable_parameters()
 
-    train_ds = PackedBlocks(args.train, tok.all_special_ids)
-    eval_ds = PackedBlocks(args.eval, tok.all_special_ids) if args.eval else None
-    collator = DataCollatorForLanguageModeling(tokenizer=tok, mlm=True,
-                                              mlm_probability=args.mlm_prob)
+    train_ds = PackedBlocks(args.train)
+    eval_ds = PackedBlocks(args.eval) if args.eval else None
+    for name, dataset in (("train", train_ds), ("eval", eval_ds)): #safety check
+        if dataset is None:
+            continue
+        expected_ids = (tok.cls_token_id, tok.sep_token_id, tok.pad_token_id)
+        packed_ids = (dataset.cls_token_id, dataset.separator_token_id,
+                      dataset.pad_token_id)
+        if packed_ids != expected_ids:
+            raise ValueError(f"{name} pack and tokenizer use different special tokens")
+    collator = PackedMLMCollator(tok, args.mlm_prob, legacy_modernbert_inputs)
 
-    tokens_per_step = args.bsz * args.accum * world_size * train_ds.seqlen
+    mean_tokens_per_block = train_ds.n_tokens / len(train_ds)
+    tokens_per_step = round(args.bsz * args.accum * world_size * mean_tokens_per_block)
     if is_main:
         print(f"[dapt] train blocks={len(train_ds):,} seqlen={train_ds.seqlen} "
-              f"| world={world_size} | tokens/step={tokens_per_step:,} "
-              f"| ~{len(train_ds)*train_ds.seqlen/1e9:.2f}B tokens/epoch", flush=True)
+              f"packing={train_ds.packing_efficiency:.2%} | world={world_size} "
+              f"| ~tokens/step={tokens_per_step:,} "
+              f"| {train_ds.n_tokens/1e9:.2f}B real tokens/epoch "
+              f"| compile={'selective' if args.torch_compile else 'off'}", flush=True)
 
     # Warmup-Stable-Decay (ModernBERT continued-pretraining recipe): short warmup,
     # long stable hold at the peak LR, then a linear decay tail. num_decay_steps is

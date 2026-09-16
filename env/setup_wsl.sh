@@ -27,9 +27,12 @@ uv pip install torch --index-url https://download.pytorch.org/whl/cu124
 
 echo "=== HF + data stack ==="
 uv pip install \
-  "transformers>=4.48" "datasets>=2.19" accelerate tokenizers evaluate \
+  "transformers>=4.52.2,<5" "datasets>=2.19" accelerate tokenizers evaluate \
   scikit-learn pandas pyarrow orjson tqdm safetensors sentencepiece \
   huggingface_hub
+
+echo "=== FlashAttention 2 ==="
+FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=4 uv pip install "flash-attn==2.6.3" --no-build-isolation --no-cache
 
 echo "=== verify ==="
 python - <<'PY'

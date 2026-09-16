@@ -78,7 +78,9 @@ bash hpc/submit.sh hpc/pretrain.sbatch
 
 Defaults reproduce the pilot **v2-wsd recipe** on one A100x4 node: WSD scheduler,
 peak LR 2e-4, MLM 0.30, seqlen 1024, global batch 256 blocks (~262k tokens/step),
-one pass over the pack. Override via environment variables at submit time:
+one pass over the pack. Stored PAD tails are removed before the model and
+FlashAttention uses the recorded document boundaries. Override via environment
+variables at submit time:
 
 ```bash
 CB2_RUN=v2-hpc-10b CB2_LR=2e-4 CB2_SCHED=wsd bash hpc/submit.sh hpc/pretrain.sbatch

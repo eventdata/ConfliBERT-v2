@@ -30,6 +30,9 @@ pip install torch --index-url https://download.pytorch.org/whl/cu124
 echo "=== project dependencies ==="
 pip install -r requirements.txt
 
+echo "=== FlashAttention 2 (installed after torch) ==="
+FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=8 pip install "flash-attn==2.6.3" --no-build-isolation --no-cache-dir
+
 echo "=== pre-download base models + tokenizer into HF_HOME (both sizes) ==="
 python - <<'PY'
 import os

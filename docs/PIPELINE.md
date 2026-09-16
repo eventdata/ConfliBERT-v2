@@ -152,6 +152,25 @@ an experiment, not a default - tag the pack accordingly.
 
 Single GPU and `torchrun` DDP both work; see `hpc/pretrain.sbatch` for the
 canonical Delta invocation and `docs/HPC_DELTA.md` for scaling rules.
+The collator removes stored PAD tails and uses each segment length as a
+FlashAttention boundary. Hugging Face then flattens the batch, resets positions
+at every segment, and prevents attention between documents.
+`torch.compile` is enabled by default through ModernBERT's selective
+`reference_compile` path: embeddings, MLPs, and the MLM head are compiled while
+FlashAttention 2 stays outside the compiled graph. Full-model compilation is
+avoided because it can cause an FP32/BF16 dtype mismatch around FlashAttention.
+Use `--no-torch-compile` to disable this selective compilation.
+
+**FlashAttention installation.** When a CUDA compiler is available, prefer a
+forced source build after installing PyTorch. This builds FlashAttention
+against the installed PyTorch/CUDA environment and reduces the risk of ABI or
+undefined-symbol errors from an incompatible prebuilt wheel:
+
+```bash
+FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=8 \
+  python -m pip install "flash-attn==2.6.3" \
+  --no-build-isolation --no-cache-dir
+```
 
 **Two model sizes are in scope for the scaled run**: `answerdotai/ModernBERT-base`
 (150M params) and `answerdotai/ModernBERT-large` (395M). They share one

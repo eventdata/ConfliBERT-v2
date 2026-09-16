@@ -4,7 +4,7 @@
 # (hpc/setup_delta.sh does this for you.)
 
 # core training + eval
-transformers>=4.48
+transformers>=4.52.2,<5
 accelerate
 tokenizers
 safetensors
@@ -30,3 +30,7 @@ datasets
 # task-specific extras
 pypdf           # CrisisWatch PDF parsing
 requests        # LLM API baselines (OpenRouter)
+
+# GPU DAPT uses flash-attn==2.6.3, matching ModernBERT and Transformers 4.52.2.
+# Install it after PyTorch with --no-build-isolation; the environment setup
+# scripts do this separately.

@@ -24,11 +24,11 @@ def parse_weights(s: str):
     return w
 
 
-def document_segments(token_ids, tok, content_length):
+def document_segments(token_ids, cls, sep, content_length):
     """Split long content and add the tokenizer's special tokens to each part."""
     chunks = [token_ids[i:i + content_length]
               for i in range(0, len(token_ids), content_length)]
-    return [tok.build_inputs_with_special_tokens(chunk) for chunk in chunks]
+    return [[cls] + chunk + [sep] for chunk in chunks]
 
 
 class GreedyBestFitPacker: # very similar to what ModernBERT's GreedyBestFitSequencePacker
@@ -167,7 +167,7 @@ def main():
         encoded = tok(text_batch, add_special_tokens=False, truncation=False,
                       return_attention_mask=False)["input_ids"]
         for ids in encoded:
-            segments = document_segments(ids, tok, content_length)
+            segments = document_segments(ids, cls, sep, content_length)
             if not segments:
                 continue
             n_docs += 1
